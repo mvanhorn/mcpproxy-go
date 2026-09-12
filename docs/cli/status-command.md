@@ -26,9 +26,9 @@ The command operates in two modes:
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--show-key` | | `false` | Display the full unmasked API key |
-| `--web-url` | | `false` | Print only the Web UI URL (for piping) |
-| `--reset-key` | | `false` | Regenerate API key and save to config |
+| `--show-key` | | `false` | Display full credentials in the API key and Web UI URL fields |
+| `--web-url` | | `false` | Print only the authenticated Web UI URL, including the full key (for piping) |
+| `--reset-key` | | `false` | Regenerate API key, save to config, and show the full new key |
 | `--output` | `-o` | `table` | Output format: table, json, yaml |
 | `--json` | | `false` | Shorthand for `-o json` |
 
@@ -49,7 +49,7 @@ MCPProxy Status
   Listen:      127.0.0.1:8080
   Uptime:      2h 15m
   API Key:     a1b2****gh78
-  Web UI:      http://127.0.0.1:8080/ui/?apikey=a1b2...gh78
+  Web UI:      http://127.0.0.1:8080/ui/?apikey=a1b2%2A%2A%2A%2Agh78
   Routing:     retrieve_tools
   Servers:     12 connected, 2 quarantined
   Socket:      /Users/you/.mcpproxy/mcpproxy.sock
@@ -63,7 +63,7 @@ MCPProxy Status
   State:       Not running
   Listen:      127.0.0.1:8080 (configured)
   API Key:     a1b2****gh78
-  Web UI:      http://127.0.0.1:8080/ui/?apikey=a1b2...gh78
+  Web UI:      http://127.0.0.1:8080/ui/?apikey=a1b2%2A%2A%2A%2Agh78
   Config:      /Users/you/.mcpproxy/mcp_config.json
 ```
 
@@ -81,11 +81,13 @@ mcpproxy status --show-key -o json | jq -r .api_key | pbcopy
 
 ```bash
 # macOS
-open $(mcpproxy status --web-url)
+open "$(mcpproxy status --web-url)"
 
 # Linux
-xdg-open $(mcpproxy status --web-url)
+xdg-open "$(mcpproxy status --web-url)"
 ```
+
+`--web-url` prints the original authenticated URL and a newline, with no status labels. It includes the full key even without `--show-key`, so the URL can authenticate in your browser. The masked URL in ordinary status output is for diagnostics and cannot authenticate.
 
 ### Reset API Key
 
@@ -125,7 +127,7 @@ mcpproxy status -o json
   "uptime": "2h 15m",
   "uptime_seconds": 8100,
   "api_key": "a1b2****gh78",
-  "web_ui_url": "http://127.0.0.1:8080/ui/?apikey=...",
+  "web_ui_url": "http://127.0.0.1:8080/ui/?apikey=a1b2%2A%2A%2A%2Agh78",
   "routing_mode": "retrieve_tools",
   "servers": {
     "connected": 12,
@@ -158,13 +160,15 @@ In machine-readable output (`-o json`/`-o yaml`) the `update` object also carrie
 
 ## API Key Masking
 
-By default, the API key is masked showing only the first 4 and last 4 characters:
+By default, table, JSON, and YAML output mask both the API key field and every `apikey` query value in the Web UI URL. This applies whether status comes from a running daemon or the config file. Keys longer than 8 characters show only the first 4 and last 4 characters:
 
 ```
 a1b2c3d4e5f6...7890abcd  →  a1b2****abcd
 ```
 
-Use `--show-key` to reveal the full key. The `--reset-key` flag implicitly shows the full new key.
+Keys of 8 characters or fewer, including empty query values, display as `****`. In the URL, the masking asterisks are percent-encoded as `%2A`. The URL's host, path, fragment, and unrelated query values are preserved. If the URL or its query cannot be parsed safely, the Web UI URL field is empty.
+
+Use `--show-key` to reveal full credentials in both fields. The `--reset-key` flag implicitly enables this behavior for the new key. `--web-url` also intentionally reveals the full URL credential for browser piping; combining it with `--reset-key` keeps stdout URL-only, while reset notices go to stderr.
 
 ## Transport and Authentication
 

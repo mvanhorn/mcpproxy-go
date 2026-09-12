@@ -2,13 +2,19 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
+	"gopkg.in/yaml.v3"
 )
 
 func TestStatusMaskAPIKey(t *testing.T) {
@@ -92,6 +98,68 @@ func TestStatusBuildWebUIURL(t *testing.T) {
 			result := statusBuildWebUIURL(tt.listenAddr, tt.apiKey)
 			if result != tt.expected {
 				t.Errorf("statusBuildWebUIURL(%q, %q) = %q, want %q", tt.listenAddr, tt.apiKey, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestStatusMaskWebUIURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		keys    []string
+		invalid bool
+	}{
+		{name: "long key", input: "http://localhost/ui/?apikey=123456789abcdef", keys: []string{"1234****cdef"}},
+		{name: "short key", input: "http://localhost/ui/?apikey=12345678", keys: []string{"****"}},
+		{name: "encoded key and parameter name", input: "https://localhost/ui/?api%6bey=%61bcd%2Bsecret%2Ftail", keys: []string{"abcd****tail"}},
+		{name: "repeated keys", input: "http://localhost/ui/?apikey=first-long-secret&apikey=short&apikey=", keys: []string{"firs****cret", "****", "****"}},
+		{name: "empty key", input: "http://localhost/ui/?apikey=", keys: []string{"****"}},
+		{name: "bare key", input: "http://localhost/ui/?apikey", keys: []string{"****"}},
+		{name: "custom URL", input: "https://console.example:9443/custom%20path/ui?theme=dark&apikey=remote-long-secret&next=%2Fa%3Fb%3Dc&tag=a&tag=b#settings", keys: []string{"remo****cret"}},
+		{name: "no key", input: "https://console.example/custom/ui?z=%20&a=1#settings"},
+		{name: "empty URL", input: ""},
+		{name: "invalid URL escape", input: "https://localhost/%zz?apikey=raw-secret-credential", invalid: true},
+		{name: "invalid key escape", input: "https://localhost/ui?apikey=raw-secret-credential%zz", invalid: true},
+		{name: "invalid unrelated query escape", input: "https://localhost/ui?apikey=raw-secret-credential&next=%zz", invalid: true},
+		{name: "invalid query separator", input: "https://localhost/ui?apikey=raw-secret-credential;other=value", invalid: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := statusMaskWebUIURL(tt.input)
+			if tt.invalid {
+				if got != "" {
+					t.Errorf("invalid display URL must be empty, got %q", got)
+				}
+				return
+			}
+			if tt.keys == nil && got != tt.input {
+				t.Errorf("credential-free URL changed: got %q, want %q", got, tt.input)
+			}
+			parsed, err := url.Parse(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			query, err := url.ParseQuery(parsed.RawQuery)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(query["apikey"], tt.keys) {
+				t.Errorf("masked keys = %q, want %q", query["apikey"], tt.keys)
+			}
+			original, err := url.Parse(tt.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			originalQuery := original.Query()
+			delete(query, "apikey")
+			delete(originalQuery, "apikey")
+			if !reflect.DeepEqual(query, originalQuery) {
+				t.Errorf("unrelated query changed: got %v, want %v", query, originalQuery)
+			}
+			original.RawQuery, parsed.RawQuery = "", ""
+			if *original != *parsed {
+				t.Errorf("URL components changed: got %s, want %s", parsed, original)
 			}
 		})
 	}
@@ -217,82 +285,285 @@ func TestFormatStatusTable(t *testing.T) {
 	})
 }
 
-func TestShowKeyFlag(t *testing.T) {
-	fullKey := "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
-	info := &StatusInfo{
-		State:      "Not running",
-		ListenAddr: "127.0.0.1:8080",
-		APIKey:     fullKey, // Not masked when --show-key
-		WebUIURL:   "http://127.0.0.1:8080/ui/?apikey=" + fullKey,
+// Status command tests mutate command globals and must not run in parallel.
+func setupStatusCommandTest(t *testing.T, daemon bool, webUIURL string) *config.Config {
+	t.Helper()
+	clearDaemonEnv(t)
+	t.Setenv("MCPPROXY_OUTPUT", "")
+	t.Setenv("MCPPROXY_LISTEN", "")
+	t.Setenv("MCPPROXY_DATA", "")
+	oldConfig, oldDataDir := configFile, dataDir
+	oldFormat, oldJSON := globalOutputFormat, globalJSONOutput
+	oldShow, oldWeb, oldReset := statusShowKey, statusWebURL, statusResetKey
+	t.Cleanup(func() {
+		configFile, dataDir = oldConfig, oldDataDir
+		globalOutputFormat, globalJSONOutput = oldFormat, oldJSON
+		statusShowKey, statusWebURL, statusResetKey = oldShow, oldWeb, oldReset
+	})
+	dataDir = t.TempDir()
+	configFile = config.GetConfigPath(dataDir)
+	globalJSONOutput = false
+	cfg := config.DefaultConfig()
+	cfg.Listen = "127.0.0.1:8080"
+	cfg.DataDir = dataDir
+	cfg.APIKey = "local-credential-0123456789abcdef"
+	if err := config.SaveConfig(cfg, configFile); err != nil {
+		t.Fatal(err)
 	}
-
-	t.Run("table output with show-key", func(t *testing.T) {
-		old := os.Stdout
-		r, w, _ := os.Pipe()
-		os.Stdout = w
-
-		printStatusTable(info)
-
-		w.Close()
-		os.Stdout = old
-
-		buf := make([]byte, 4096)
-		n, _ := r.Read(buf)
-		output := string(buf[:n])
-
-		if !strings.Contains(output, fullKey) {
-			t.Errorf("expected full key in output, got:\n%s", output)
-		}
-	})
-
-	t.Run("JSON output with show-key", func(t *testing.T) {
-		old := os.Stdout
-		r, w, _ := os.Pipe()
-		os.Stdout = w
-
-		err := printStatusJSON(info)
-
-		w.Close()
-		os.Stdout = old
-
+	// Read the saved key for each request so reset tests also verify that
+	// transport authentication uses the newly persisted, unmasked key.
+	cfgPath := configFile
+	var statusRequests, infoRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, err := os.ReadFile(cfgPath)
 		if err != nil {
-			t.Fatalf("printStatusJSON failed: %v", err)
+			t.Errorf("read fixture config: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
-
-		buf := make([]byte, 4096)
-		n, _ := r.Read(buf)
-		output := string(buf[:n])
-
-		var result StatusInfo
-		if jsonErr := json.Unmarshal([]byte(output), &result); jsonErr != nil {
-			t.Fatalf("invalid JSON output: %v", jsonErr)
+		var saved config.Config
+		if err := json.Unmarshal(data, &saved); err != nil {
+			t.Errorf("decode fixture config: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
-
-		if result.APIKey != fullKey {
-			t.Errorf("expected full key in JSON, got %q", result.APIKey)
+		if got := r.Header.Get("X-API-Key"); got != saved.APIKey {
+			t.Errorf("authentication key = %q, want %q", got, saved.APIKey)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/status":
+			statusRequests.Add(1)
+			if !daemon {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = w.Write([]byte(`{"success":true,"data":{"running":true,"listen_addr":"127.0.0.1:8080"}}`))
+		case "/api/v1/info":
+			infoRequests.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"data":    map[string]interface{}{"web_ui_url": webUIURL},
+			})
+		default:
+			t.Errorf("unexpected daemon request: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(func() {
+		server.Close()
+		if statusRequests.Load() == 0 {
+			t.Error("command did not probe the test daemon")
+		}
+		if daemon && infoRequests.Load() == 0 {
+			t.Error("command did not collect the daemon URL")
 		}
 	})
+	t.Setenv("MCPPROXY_TRAY_ENDPOINT", server.URL)
+	return cfg
+}
+
+func readStatusTestConfig(t *testing.T, path string) *config.Config {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg config.Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	return &cfg
+}
+
+func executeStatusTestCommand(t *testing.T, format string, args ...string) string {
+	t.Helper()
+	globalOutputFormat = format
+	cmd := GetStatusCommand()
+	cmd.SetArgs(args)
+	var err error
+	output := captureStdout(t, func() { err = cmd.Execute() })
+	if err != nil {
+		t.Fatalf("status failed: %v", err)
+	}
+	return output
+}
+
+func decodeStatusTestOutput(t *testing.T, format, output string) StatusInfo {
+	t.Helper()
+	var info StatusInfo
+	switch format {
+	case "json":
+		if err := json.Unmarshal([]byte(output), &info); err != nil {
+			t.Fatal(err)
+		}
+	case "yaml":
+		if err := yaml.Unmarshal([]byte(output), &info); err != nil {
+			t.Fatal(err)
+		}
+	default:
+		for _, line := range strings.Split(output, "\n") {
+			label, value, _ := strings.Cut(strings.TrimSpace(line), ":")
+			switch label {
+			case "State":
+				info.State = strings.TrimSpace(value)
+			case "API Key":
+				info.APIKey = strings.TrimSpace(value)
+			case "Web UI":
+				info.WebUIURL = strings.TrimSpace(value)
+			}
+		}
+	}
+	return info
+}
+
+func TestRunStatusCredentials(t *testing.T) {
+	const daemonKey = "remote-credential-fedcba9876543210"
+	const daemonURL = "https://console.example:9443/custom/ui?theme=dark&apikey=" + daemonKey + "#settings"
+	for _, mode := range []string{"config", "daemon"} {
+		for _, format := range []string{"table", "json", "yaml"} {
+			for _, flag := range []string{"masked", "--show-key"} {
+				t.Run(mode+"/"+format+"/"+flag, func(t *testing.T) {
+					cfg := setupStatusCommandTest(t, mode == "daemon", daemonURL)
+					rawURL := statusBuildWebUIURL(cfg.Listen, cfg.APIKey)
+					urlKey, state := cfg.APIKey, "Not running"
+					if mode == "daemon" {
+						rawURL, urlKey, state = daemonURL, daemonKey, "Running"
+					}
+					var args []string
+					if flag == "--show-key" {
+						args = append(args, flag)
+					}
+					output := executeStatusTestCommand(t, format, args...)
+					info := decodeStatusTestOutput(t, format, output)
+					wantKey, wantURLKey := cfg.APIKey, urlKey
+					if flag == "masked" {
+						wantKey, wantURLKey = "loca****cdef", "loca****cdef"
+						if mode == "daemon" {
+							wantURLKey = "remo****3210"
+						}
+						for _, key := range []string{cfg.APIKey, urlKey} {
+							if strings.Contains(output, key) {
+								t.Errorf("ordinary status leaked full credential: %s", output)
+							}
+						}
+					} else if info.WebUIURL != rawURL {
+						t.Errorf("--show-key URL = %q, want %q", info.WebUIURL, rawURL)
+					}
+					if info.State != state || info.APIKey != wantKey {
+						t.Errorf("state/key = %q/%q, want %q/%q", info.State, info.APIKey, state, wantKey)
+					}
+					parsed, err := url.Parse(info.WebUIURL)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if got := parsed.Query().Get("apikey"); got != wantURLKey {
+						t.Errorf("URL key = %q, want %q", got, wantURLKey)
+					}
+					if saved := readStatusTestConfig(t, configFile); saved.APIKey != cfg.APIKey {
+						t.Errorf("ordinary status changed saved key to %q", saved.APIKey)
+					}
+				})
+			}
+		}
+	}
 }
 
 func TestWebURLFlag(t *testing.T) {
-	expectedURL := "http://127.0.0.1:8080/ui/?apikey=testkey123"
-	info := &StatusInfo{
-		WebUIURL: expectedURL,
+	const daemonURL = "https://console.example/custom/ui?theme=dark&apikey=remote-credential#settings"
+	for _, mode := range []string{"config", "daemon"} {
+		for _, showKey := range []bool{false, true} {
+			name := mode + "/web-url"
+			if showKey {
+				name += "/show-key"
+			}
+			t.Run(name, func(t *testing.T) {
+				cfg := setupStatusCommandTest(t, mode == "daemon", daemonURL)
+				want := statusBuildWebUIURL(cfg.Listen, cfg.APIKey)
+				if mode == "daemon" {
+					want = daemonURL
+				}
+				args := []string{"--web-url"}
+				if showKey {
+					args = append(args, "--show-key")
+				}
+				if got := executeStatusTestCommand(t, "json", args...); got != want+"\n" {
+					t.Errorf("--web-url output = %q, want %q", got, want+"\n")
+				}
+			})
+		}
 	}
+}
 
-	// Simulate --web-url output (just the URL)
-	output := info.WebUIURL
-
-	if output != expectedURL {
-		t.Errorf("expected URL %q, got %q", expectedURL, output)
+func TestRunStatusResetKey(t *testing.T) {
+	for _, format := range []string{"table", "json", "yaml", "web-url"} {
+		t.Run(format, func(t *testing.T) {
+			cfg := setupStatusCommandTest(t, false, "")
+			stderr, err := os.CreateTemp(t.TempDir(), "stderr")
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldStderr := os.Stderr
+			os.Stderr = stderr
+			t.Cleanup(func() {
+				os.Stderr = oldStderr
+				_ = stderr.Close()
+			})
+			args := []string{"--reset-key"}
+			if format == "web-url" {
+				args = append(args, "--web-url")
+			}
+			output := executeStatusTestCommand(t, format, args...)
+			saved := readStatusTestConfig(t, configFile)
+			warnings, err := os.ReadFile(stderr.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(warnings), "Warning: Resetting the API key") ||
+				!strings.Contains(string(warnings), "New API key: "+saved.APIKey) {
+				t.Errorf("reset notices missing from stderr: %s", warnings)
+			}
+			if strings.Contains(output, "Warning:") || strings.Contains(output, "New API key:") {
+				t.Errorf("reset notices leaked to stdout: %s", output)
+			}
+			if saved.APIKey == cfg.APIKey || len(saved.APIKey) != 64 {
+				t.Fatalf("reset did not persist a new 64-character key: %q", saved.APIKey)
+			}
+			wantURL := statusBuildWebUIURL(cfg.Listen, saved.APIKey)
+			if format == "web-url" {
+				if output != wantURL+"\n" {
+					t.Errorf("reset URL output = %q, want %q", output, wantURL+"\n")
+				}
+				return
+			}
+			info := decodeStatusTestOutput(t, format, output)
+			if info.APIKey != saved.APIKey || info.WebUIURL != wantURL {
+				t.Errorf("reset output did not reveal the saved key in both fields: %s", output)
+			}
+		})
 	}
+}
 
-	// Verify no extra formatting
-	if strings.Contains(output, "Web UI:") {
-		t.Error("--web-url output should not contain labels")
-	}
-	if strings.Contains(output, "\n") {
-		t.Error("--web-url output should not contain embedded newlines")
+func TestRunStatusInvalidWebUIURL(t *testing.T) {
+	for _, rawURL := range []string{
+		"https://console.example/%zz?apikey=raw-secret-credential",
+		"https://console.example/ui?apikey=raw-secret-credential&other=%zz",
+	} {
+		for _, format := range []string{"table", "json", "yaml"} {
+			t.Run(format+"/"+rawURL, func(t *testing.T) {
+				setupStatusCommandTest(t, true, rawURL)
+				output := executeStatusTestCommand(t, format)
+				if strings.Contains(output, "raw-secret-credential") {
+					t.Errorf("invalid URL leaked credential: %s", output)
+				}
+				info := decodeStatusTestOutput(t, format, output)
+				if info.WebUIURL != "" {
+					t.Errorf("invalid display URL = %q, want empty", info.WebUIURL)
+				}
+			})
+		}
 	}
 }
 
